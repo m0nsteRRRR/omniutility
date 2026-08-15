@@ -1,0 +1,374 @@
+/**
+ * ytdlp.js — Core yt-dlp wrapper utilities
+ *
+ * All interactions with the yt-dlp binary go through these helpers.
+ * We use child_process.spawn (not exec) so we can:
+ *  - Stream download output directly to the HTTP response
+ *  - Avoid buffering entire files in memory
+ *  - Kill the process if the client disconnects
+ */
+
+'use strict';
+
+const { spawn } = require('child_process');
+const path = require('path');
+
+// ── Config ────────────────────────────────────────────────────────────────────
+const YTDLP_BIN  = process.env.YTDLP_PATH  || 'yt-dlp';
+const FFMPEG_BIN = process.env.FFMPEG_PATH || 'ffmpeg';
+const TEMP_DIR   = process.env.TEMP_DIR    || '/tmp/ytdlp-scratch';
+
+// Supported YouTube-like domains
+const YOUTUBE_DOMAINS = [
+  'youtube.com', 'youtu.be', 'www.youtube.com',
+  'm.youtube.com', 'music.youtube.com',
+];
+
+// ── Validators ────────────────────────────────────────────────────────────────
+
+/**
+ * Checks whether a URL is a valid YouTube URL.
+ * @param {string} url
+ * @returns {boolean}
+ */
+function isYouTubeUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return YOUTUBE_DOMAINS.some(d => parsed.hostname === d);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Basic URL sanity check — must be http/https, no shell metacharacters.
+ * @param {string} url
+ * @returns {boolean}
+ */
+function isSafeUrl(url) {
+  if (typeof url !== 'string' || url.length > 2048) return false;
+  try {
+    const parsed = new URL(url);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return false;
+    // Block shell metacharacters that could escape the argument
+    if (/[;&|`$<>\\]/.test(url)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ── Format Helpers ────────────────────────────────────────────────────────────
+
+/**
+ * Maps our frontend format IDs to yt-dlp format selectors.
+ *
+ * yt-dlp format strings:
+ *  - "bestvideo[height<=N]+bestaudio/best[height<=N]" for video
+ *  - "bestaudio" for audio-only
+ *  - "/best" fallback ensures something always downloads
+ */
+const FORMAT_SELECTORS = {
+  '4k':   'bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best[height<=2160]/best',
+  '2k':   'bestvideo[height<=1440][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1440]+bestaudio/best[height<=1440]/best',
+  '1080': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
+  '720':  'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+  '480':  'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]/best',
+  '360':  'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=360]+bestaudio/best[height<=360]/best',
+  'mp3':  'bestaudio/best',
+  'm4a':  'bestaudio[ext=m4a]/bestaudio/best',
+};
+
+/**
+ * Get the yt-dlp format selector string for a given frontend format ID.
+ * @param {string} formatId
+ * @returns {string}
+ */
+function getFormatSelector(formatId) {
+  return FORMAT_SELECTORS[formatId] || FORMAT_SELECTORS['720'];
+}
+
+// ── Video Info ─────────────────────────────────────────────────────────────────
+
+/**
+ * Fetches video metadata from yt-dlp --dump-json.
+ * Returns a cleaned-up object safe to send to the frontend.
+ *
+ * @param {string} url
+ * @returns {Promise<object>}
+ */
+function getVideoInfo(url) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '--dump-json',
+      '--no-playlist',
+      '--socket-timeout', '15',
+      '--no-warnings',
+      url,
+    ];
+
+    console.log(`[yt-dlp] info: ${url}`);
+    const proc = spawn(YTDLP_BIN, args, { env: { ...process.env } });
+
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+    proc.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        console.error(`[yt-dlp] info failed (code ${code}): ${stderr.slice(0, 500)}`);
+        return reject(new Error(parseYtdlpError(stderr)));
+      }
+      try {
+        const raw = JSON.parse(stdout);
+        resolve(sanitizeVideoInfo(raw));
+      } catch (e) {
+        reject(new Error('Failed to parse yt-dlp output'));
+      }
+    });
+
+    proc.on('error', (err) => {
+      reject(new Error(`yt-dlp not found or failed to start: ${err.message}`));
+    });
+
+    // Safety timeout — kill if yt-dlp hangs
+    setTimeout(() => {
+      proc.kill('SIGKILL');
+      reject(new Error('yt-dlp info request timed out (30s)'));
+    }, 30_000);
+  });
+}
+
+/**
+ * Strips raw yt-dlp JSON down to what the frontend needs.
+ * @param {object} raw
+ * @returns {object}
+ */
+function sanitizeVideoInfo(raw) {
+  // Build available quality list from formats
+  const qualityMap = {};
+  (raw.formats || []).forEach((f) => {
+    const h = f.height;
+    if (!h || f.vcodec === 'none') return; // audio-only formats, skip for video list
+    const key = h <= 360 ? '360' : h <= 480 ? '480' : h <= 720 ? '720' : h <= 1080 ? '1080' : h <= 1440 ? '2k' : '4k';
+    if (!qualityMap[key]) qualityMap[key] = { id: key, height: h, hasVideo: true };
+  });
+
+  // Always include audio options if there are any audio streams
+  const hasAudio = (raw.formats || []).some(f => f.acodec !== 'none');
+  if (hasAudio) {
+    qualityMap['mp3'] = { id: 'mp3', height: 0, hasVideo: false };
+    qualityMap['m4a'] = { id: 'm4a', height: 0, hasVideo: false };
+  }
+
+  return {
+    id:          raw.id,
+    title:       raw.title || 'Unknown Title',
+    uploader:    raw.uploader || raw.channel || 'Unknown',
+    thumbnail:   raw.thumbnail || null,
+    duration:    raw.duration || 0,
+    durationStr: raw.duration_string || formatDuration(raw.duration),
+    viewCount:   raw.view_count || 0,
+    likeCount:   raw.like_count || null,
+    uploadDate:  raw.upload_date || null,
+    description: (raw.description || '').slice(0, 300),
+    webpage_url: raw.webpage_url || raw.original_url,
+    availableFormats: Object.values(qualityMap),
+  };
+}
+
+/**
+ * Format seconds into HH:MM:SS or MM:SS string.
+ * @param {number} secs
+ * @returns {string}
+ */
+function formatDuration(secs) {
+  if (!secs) return '0:00';
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = secs % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  return `${m}:${String(s).padStart(2,'0')}`;
+}
+
+// ── Download Stream ────────────────────────────────────────────────────────────
+
+/**
+ * Spawns yt-dlp and pipes output to the provided writable stream (HTTP response).
+ * For MP3: yt-dlp extracts audio and FFmpeg transcodes to mp3 on the fly.
+ * For video: yt-dlp merges video+audio using FFmpeg and pipes mp4 to stdout.
+ *
+ * @param {string}   url       - Video URL
+ * @param {string}   formatId  - One of: 4k, 2k, 1080, 720, 480, 360, mp3, m4a
+ * @param {import('http').ServerResponse} res - Express response object to pipe into
+ * @returns {{ proc: ChildProcess, ffmpegProc: ChildProcess|null }} - so callers can kill on disconnect
+ */
+function downloadStream(url, formatId, res) {
+  const selector = getFormatSelector(formatId);
+  const isAudio  = formatId === 'mp3' || formatId === 'm4a';
+  const ext      = formatId === 'mp3' ? 'mp3' : formatId === 'm4a' ? 'm4a' : 'mp4';
+  const mime     = isAudio
+    ? (formatId === 'mp3' ? 'audio/mpeg' : 'audio/mp4')
+    : 'video/mp4';
+
+  console.log(`[yt-dlp] download: ${url} | format: ${formatId} | selector: ${selector}`);
+
+  // ── MP3 path: yt-dlp → pipe raw audio → FFmpeg → mp3 ──────────────────────
+  if (formatId === 'mp3') {
+    const ytdlpArgs = [
+      '--no-playlist',
+      '--no-warnings',
+      '--socket-timeout', '20',
+      '-f', selector,
+      '-o', '-',       // pipe to stdout
+      url,
+    ];
+
+    const ffmpegArgs = [
+      '-hide_banner', '-loglevel', 'error',
+      '-i', 'pipe:0',   // stdin from yt-dlp
+      '-vn',            // no video
+      '-acodec', 'libmp3lame',
+      '-ab', '320k',
+      '-ar', '44100',
+      '-f', 'mp3',
+      'pipe:1',         // stdout → response
+    ];
+
+    const ytProc = spawn(YTDLP_BIN, ytdlpArgs, { env: { ...process.env } });
+    const ffProc = spawn(FFMPEG_BIN, ffmpegArgs, { env: { ...process.env } });
+
+    // Pipe yt-dlp → ffmpeg → response
+    ytProc.stdout.pipe(ffProc.stdin);
+    ffProc.stdout.pipe(res);
+
+    ytProc.stderr.on('data', d => console.error('[yt-dlp stderr]', d.toString().trim()));
+    ffProc.stderr.on('data', d => console.error('[ffmpeg stderr]', d.toString().trim()));
+
+    ytProc.on('error', (e) => { console.error('[yt-dlp error]', e.message); res.end(); });
+    ffProc.on('error', (e) => { console.error('[ffmpeg error]', e.message); res.end(); });
+    ffProc.on('close', (code) => {
+      if (code !== 0) console.error(`[ffmpeg] exited with code ${code}`);
+    });
+
+    return { proc: ytProc, ffmpegProc: ffProc };
+  }
+
+  // ── M4A path: yt-dlp → pipe m4a directly ──────────────────────────────────
+  if (formatId === 'm4a') {
+    const ytdlpArgs = [
+      '--no-playlist',
+      '--no-warnings',
+      '--socket-timeout', '20',
+      '-f', selector,
+      '--merge-output-format', 'm4a',
+      '-o', '-',
+      url,
+    ];
+    const ytProc = spawn(YTDLP_BIN, ytdlpArgs, { env: { ...process.env } });
+    ytProc.stdout.pipe(res);
+    ytProc.stderr.on('data', d => console.error('[yt-dlp stderr]', d.toString().trim()));
+    ytProc.on('error', (e) => { console.error('[yt-dlp error]', e.message); res.end(); });
+    return { proc: ytProc, ffmpegProc: null };
+  }
+
+  // ── Video path: yt-dlp merges video+audio → mp4 ───────────────────────────
+  // yt-dlp uses ffmpeg internally to merge. We use a temp dir for the merge
+  // then stream it. Alternatively: --merge-output-format mp4 -o pipe:1
+  // Note: yt-dlp can't pipe merged output directly on all platforms,
+  // so we write to a temp file and stream it.
+  const { v4: uuidv4 } = require('uuid');
+  const os   = require('os');
+  const fs   = require('fs');
+  const tmpFile = path.join(TEMP_DIR, `${uuidv4()}.mp4`);
+
+  const ytdlpArgs = [
+    '--no-playlist',
+    '--no-warnings',
+    '--socket-timeout', '20',
+    '-f', selector,
+    '--merge-output-format', 'mp4',
+    '--ffmpeg-location', FFMPEG_BIN,
+    '-o', tmpFile,
+    url,
+  ];
+
+  const ytProc = spawn(YTDLP_BIN, ytdlpArgs, { env: { ...process.env } });
+
+  ytProc.stderr.on('data', d => {
+    const msg = d.toString().trim();
+    if (msg) console.log('[yt-dlp]', msg);
+  });
+
+  ytProc.on('error', (e) => {
+    console.error('[yt-dlp error]', e.message);
+    cleanup(tmpFile);
+    if (!res.headersSent) res.status(500).json({ error: e.message });
+  });
+
+  ytProc.on('close', (code) => {
+    if (code !== 0) {
+      console.error(`[yt-dlp] exited with code ${code}`);
+      cleanup(tmpFile);
+      if (!res.headersSent) res.status(500).json({ error: 'Download failed' });
+      return;
+    }
+
+    // Stream the temp file to response
+    const stat = fs.statSync(tmpFile);
+    if (!res.headersSent) {
+      res.setHeader('Content-Length', stat.size);
+    }
+
+    const fileStream = fs.createReadStream(tmpFile);
+    fileStream.pipe(res);
+    fileStream.on('close', () => cleanup(tmpFile));
+    fileStream.on('error', (e) => {
+      console.error('[stream error]', e.message);
+      cleanup(tmpFile);
+    });
+  });
+
+  return { proc: ytProc, ffmpegProc: null };
+}
+
+// ── Error Parsing ─────────────────────────────────────────────────────────────
+
+/**
+ * Converts raw yt-dlp stderr into a user-friendly error message.
+ * @param {string} stderr
+ * @returns {string}
+ */
+function parseYtdlpError(stderr) {
+  if (!stderr) return 'Unknown yt-dlp error';
+  if (stderr.includes('Video unavailable')) return 'This video is unavailable or private.';
+  if (stderr.includes('age-restricted'))   return 'This video is age-restricted and cannot be downloaded without login.';
+  if (stderr.includes('Sign in'))          return 'This video requires sign-in. Age-restricted or members-only content.';
+  if (stderr.includes('copyright'))        return 'This video is blocked due to copyright in your region.';
+  if (stderr.includes('Premieres in'))     return 'This video has not premiered yet.';
+  if (stderr.includes('live event'))       return 'Live streams cannot be downloaded while airing.';
+  if (stderr.includes('HTTP Error 429'))   return 'YouTube rate limit hit. Please wait a few minutes and try again.';
+  if (stderr.includes('HTTP Error 403'))   return 'Access forbidden. The video may be geo-blocked.';
+  if (stderr.includes('Unable to extract')) return 'Could not extract video info. The URL may be unsupported.';
+  return 'Failed to fetch video. Try again or check the URL.';
+}
+
+// ── Cleanup ───────────────────────────────────────────────────────────────────
+
+function cleanup(filePath) {
+  const fs = require('fs');
+  try { if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath); }
+  catch (e) { console.warn('[cleanup] could not delete', filePath, e.message); }
+}
+
+// ── Exports ───────────────────────────────────────────────────────────────────
+module.exports = {
+  getVideoInfo,
+  downloadStream,
+  isYouTubeUrl,
+  isSafeUrl,
+  getFormatSelector,
+  YOUTUBE_DOMAINS,
+};

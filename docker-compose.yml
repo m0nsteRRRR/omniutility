@@ -1,0 +1,56 @@
+version: '3.9'
+
+services:
+  # ── yt-dlp Backend ──────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: omniutility-backend
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      # Allow the Vite dev server and production frontend
+      ALLOWED_ORIGINS: "http://localhost:5173,http://localhost:4173,http://localhost:3000"
+      YOUTUBE_ONLY: "false"
+      RATE_LIMIT_WINDOW_MS: "60000"
+      RATE_LIMIT_MAX_REQUESTS: "20"
+      # Leave empty to disable API key guard (set a long random string to enable)
+      API_KEY: ""
+      YTDLP_PATH: "yt-dlp"
+      FFMPEG_PATH: "ffmpeg"
+      TEMP_DIR: "/tmp/ytdlp-scratch"
+    volumes:
+      # Persist yt-dlp cache (cookies, format cache) to speed up repeated requests
+      - ytdlp_cache:/root/.cache/yt-dlp
+      # Writable temp dir for merging video+audio
+      - ytdlp_tmp:/tmp/ytdlp-scratch
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    # Resource limits — prevent runaway downloads from consuming everything
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  ytdlp_cache:
+    driver: local
+  ytdlp_tmp:
+    driver: local

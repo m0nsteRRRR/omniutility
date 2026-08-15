@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: omniutility-backend
+    env: docker
+    region: singapore # Closest free region to India
+    plan: free
+    dockerContext: ./backend
+    dockerfilePath: ./backend/Dockerfile
+    envVars:
+      - key: PORT
+        value: 3001
+      - key: ALLOWED_ORIGINS
+        value: https://omniutility.vercel.app,http://localhost:5173
+      - key: YOUTUBE_ONLY
+        value: "false"
+      - key: RATE_LIMIT_MAX_REQUESTS
+        value: "20"
