@@ -10,7 +10,7 @@ services:
       - key: PORT
         value: 3001
       - key: ALLOWED_ORIGINS
-        value: https://omniutility.vercel.app,http://localhost:5173
+        value: https://omniutility-suite.vercel.app,https://omniutility.vercel.app,http://localhost:5173
       - key: YOUTUBE_ONLY
         value: "false"
       - key: RATE_LIMIT_MAX_REQUESTS
