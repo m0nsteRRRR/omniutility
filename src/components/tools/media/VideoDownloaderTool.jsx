@@ -96,8 +96,8 @@ export default function VideoDownloaderTool() {
     } catch (err) {
       if (err.name === 'TimeoutError') {
         setError('Request timed out. The backend may be starting up — try again in a moment.');
-      } else if (err.message.includes('fetch') || err.message.includes('network')) {
-        setError('Cannot connect to the backend. Make sure Docker is running: docker compose up');
+      } else if (err.message.includes('fetch') || err.message.includes('network') || err.message.includes('Failed to fetch')) {
+        setError('Cannot connect to the backend yet. The free server on Render is waking up (~30s) or still building — please wait a moment and try again.');
         setBackendOnline(false);
       } else {
         setError(err.message || 'Failed to fetch video info.');
@@ -151,11 +151,10 @@ export default function VideoDownloaderTool() {
           <AlertCircle size={16} color="var(--accent-red)" style={{ flexShrink: 0 }} />
           <div style={{ flex: 1 }}>
             <p style={{ color: 'var(--accent-red)', fontWeight: 700, fontSize: 13, margin: 0 }}>
-              Backend not reachable
+              Backend is starting up or unreachable
             </p>
             <p style={{ color: 'var(--text-secondary)', fontSize: 12, margin: '2px 0 0' }}>
-              Start it with: <code style={{ background: 'rgba(255,255,255,0.1)', padding: '1px 6px', borderRadius: 4 }}>docker compose up</code>
-              {' '}from the project root.
+              Free cloud hosting (Render) sleeps after inactivity and takes ~30–45s to wake up on the first request.
             </p>
           </div>
           <button className="btn btn-ghost btn-sm" onClick={checkBackend} style={{ flexShrink: 0 }}>

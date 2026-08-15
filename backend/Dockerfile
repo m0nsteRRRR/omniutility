@@ -3,7 +3,7 @@ FROM node:20-slim AS deps
 
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev
+RUN npm install --omit=dev
 
 # ── Stage 2: Final runtime image ───────────────────────────────────────────────
 FROM node:20-slim
