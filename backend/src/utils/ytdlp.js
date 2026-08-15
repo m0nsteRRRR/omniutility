@@ -102,8 +102,11 @@ function getVideoInfo(url) {
     const args = [
       '--dump-json',
       '--no-playlist',
-      '--socket-timeout', '15',
+      '--socket-timeout', '20',
       '--no-warnings',
+      '--no-check-certificates',
+      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      '--extractor-args', 'youtube:player_client=android,web',
       url,
     ];
 
@@ -220,7 +223,10 @@ function downloadStream(url, formatId, res) {
     const ytdlpArgs = [
       '--no-playlist',
       '--no-warnings',
-      '--socket-timeout', '20',
+      '--no-check-certificates',
+      '--socket-timeout', '25',
+      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      '--extractor-args', 'youtube:player_client=android,web',
       '-f', selector,
       '-o', '-',       // pipe to stdout
       url,
@@ -261,7 +267,10 @@ function downloadStream(url, formatId, res) {
     const ytdlpArgs = [
       '--no-playlist',
       '--no-warnings',
-      '--socket-timeout', '20',
+      '--no-check-certificates',
+      '--socket-timeout', '25',
+      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      '--extractor-args', 'youtube:player_client=android,web',
       '-f', selector,
       '--merge-output-format', 'm4a',
       '-o', '-',
@@ -275,10 +284,6 @@ function downloadStream(url, formatId, res) {
   }
 
   // ── Video path: yt-dlp merges video+audio → mp4 ───────────────────────────
-  // yt-dlp uses ffmpeg internally to merge. We use a temp dir for the merge
-  // then stream it. Alternatively: --merge-output-format mp4 -o pipe:1
-  // Note: yt-dlp can't pipe merged output directly on all platforms,
-  // so we write to a temp file and stream it.
   const { v4: uuidv4 } = require('uuid');
   const os   = require('os');
   const fs   = require('fs');
@@ -287,7 +292,10 @@ function downloadStream(url, formatId, res) {
   const ytdlpArgs = [
     '--no-playlist',
     '--no-warnings',
-    '--socket-timeout', '20',
+    '--no-check-certificates',
+    '--socket-timeout', '25',
+    '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    '--extractor-args', 'youtube:player_client=android,web',
     '-f', selector,
     '--merge-output-format', 'mp4',
     '--ffmpeg-location', FFMPEG_BIN,
@@ -351,8 +359,7 @@ function parseYtdlpError(stderr) {
   if (stderr.includes('live event'))       return 'Live streams cannot be downloaded while airing.';
   if (stderr.includes('HTTP Error 429'))   return 'YouTube rate limit hit. Please wait a few minutes and try again.';
   if (stderr.includes('HTTP Error 403'))   return 'Access forbidden. The video may be geo-blocked.';
-  if (stderr.includes('Unable to extract')) return 'Could not extract video info. The URL may be unsupported.';
-  return 'Failed to fetch video. Try again or check the URL.';
+  return stderr.replace(/ERROR:\s*/g, '').slice(0, 200) || 'Failed to fetch video. Try again or check the URL.';
 }
 
 // ── Cleanup ───────────────────────────────────────────────────────────────────
