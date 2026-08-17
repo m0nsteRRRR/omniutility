@@ -21,36 +21,62 @@ const FFMPEG_BIN = process.env.FFMPEG_PATH || 'ffmpeg';
 const TEMP_DIR   = process.env.TEMP_DIR    || '/tmp/ytdlp-scratch';
 
 // ── Cookies support ───────────────────────────────────────────────────────────
-// Set YTDLP_COOKIES_B64 in Render env vars to a base64-encoded Netscape-format
-// cookies.txt from your browser. This bypasses YouTube's datacenter IP blocks.
-let COOKIES_FILE = null;
-if (process.env.YTDLP_COOKIES_B64) {
-  try {
-    const cookiesPath = '/tmp/yt-cookies.txt';
-    fs.writeFileSync(cookiesPath, Buffer.from(process.env.YTDLP_COOKIES_B64, 'base64').toString('utf8'));
-    COOKIES_FILE = cookiesPath;
-    console.log('[ytdlp] Cookies file loaded from YTDLP_COOKIES_B64');
-  } catch (e) {
-    console.warn('[ytdlp] Failed to write cookies file:', e.message);
+function getCookiesPath() {
+  if (process.env.YTDLP_COOKIES_B64) {
+    try {
+      const cookiesPath = '/tmp/yt-cookies.txt';
+      fs.writeFileSync(cookiesPath, Buffer.from(process.env.YTDLP_COOKIES_B64, 'base64').toString('utf8'));
+      return cookiesPath;
+    } catch (e) {
+      console.warn('[ytdlp] Failed to write cookies file from env:', e.message);
+    }
   }
+  const possiblePaths = [
+    path.join(process.cwd(), 'cookies.txt'),
+    path.join(__dirname, '../../cookies.txt'),
+    path.join(__dirname, '../cookies.txt'),
+    '/tmp/yt-cookies.txt',
+    '/app/cookies.txt'
+  ];
+
+  for (const p of possiblePaths) {
+    if (fs.existsSync(p) && fs.statSync(p).size > 10) {
+      return p;
+    }
+  }
+  return null;
 }
 
 /**
  * Returns the base yt-dlp args shared across all calls.
- * Injects --cookies if YTDLP_COOKIES_B64 is set.
- * @param {string} playerClient  e.g. 'tv_embedded,ios'
+ * Injects --cookies and proper User-Agent.
+ * @param {string} playerClient  e.g. 'default', 'web,android', 'tv_embedded,ios'
  * @returns {string[]}
  */
-function baseArgs(playerClient) {
+function baseArgs(playerClient = 'default') {
+  const cookies = getCookiesPath();
   const args = [
     '--no-warnings',
     '--no-check-certificates',
     '--socket-timeout', '30',
     '--age-limit', '99',
-    '--user-agent', 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36',
-    '--extractor-args', `youtube:player_client=${playerClient}`,
   ];
-  if (COOKIES_FILE) args.push('--cookies', COOKIES_FILE);
+
+  if (cookies) {
+    args.push(
+      '--cookies', cookies,
+      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+    );
+  } else {
+    args.push(
+      '--user-agent', 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36'
+    );
+  }
+
+  if (playerClient && playerClient !== 'default') {
+    args.push('--extractor-args', `youtube:player_client=${playerClient}`);
+  }
+
   return args;
 }
 
@@ -175,13 +201,10 @@ function _ytdlpDumpJson(url, playerClient, timeoutMs) {
  * tv_embedded + ios bypass YouTube's cloud-IP sign-in blocks best.
  */
 function getVideoInfo(url) {
-  // Client order: most reliable on datacenter IPs first
-  const CLIENTS = [
-    'tv_embedded,ios',
-    'tv_embedded,web_creator',
-    'web_creator,ios',
-    'mweb,ios',
-  ];
+  const hasCookies = !!getCookiesPath();
+  const CLIENTS = hasCookies
+    ? ['default', 'web,android', 'mweb,ios', 'tv_embedded,ios']
+    : ['tv_embedded,ios', 'tv_embedded,web_creator', 'web_creator,ios', 'mweb,ios', 'android,ios'];
 
   return new Promise(async (resolve, reject) => {
     console.log(`[yt-dlp] info: ${url}`);

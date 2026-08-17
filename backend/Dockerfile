@@ -41,6 +41,7 @@ COPY --from=deps /app/node_modules ./node_modules
 # Copy source files
 COPY src/ ./src/
 COPY package.json ./
+COPY cookies* ./
 
 # ── Runtime directories ───────────────────────────────────────────────────────
 RUN mkdir -p /tmp/ytdlp-scratch && chmod 777 /tmp/ytdlp-scratch
