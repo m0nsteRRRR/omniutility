@@ -22,8 +22,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# ── yt-dlp (always latest — extractor fixes are frequent) ────────────────────
-RUN pip3 install --no-cache-dir --upgrade yt-dlp --break-system-packages
+# ── yt-dlp with curl-cffi (TLS impersonation for datacenter IP anti-bot bypass) ────
+RUN pip3 install --no-cache-dir --upgrade "yt-dlp[default,curl-cffi]" --break-system-packages
 
 # ── Verify all binaries ───────────────────────────────────────────────────────
 RUN echo "=== Versions ===" \

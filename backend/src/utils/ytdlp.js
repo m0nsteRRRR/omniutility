@@ -60,6 +60,7 @@ function baseArgs(playerClient = 'default') {
     '--no-check-certificates',
     '--socket-timeout', '30',
     '--age-limit', '99',
+    '--impersonate', 'chrome',
   ];
 
   if (cookies) {
