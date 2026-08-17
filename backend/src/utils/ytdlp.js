@@ -507,7 +507,7 @@ function cleanup(filePath) {
   catch (e) { console.warn('[cleanup] could not delete', filePath, e.message); }
 }
 
-// ── Exports ───────────────────────────────────────────────────────────────────
+module.exports = {
   getVideoInfo,
   downloadStream,
   startBackgroundDownload,
