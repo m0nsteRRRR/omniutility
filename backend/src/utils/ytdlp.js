@@ -97,50 +97,85 @@ function getFormatSelector(formatId) {
  * @param {string} url
  * @returns {Promise<object>}
  */
-function getVideoInfo(url) {
+/**
+ * Attempts yt-dlp --dump-json with the given player_client arg.
+ * Resolves with raw JSON string or rejects with stderr.
+ * @param {string} url
+ * @param {string} playerClient  e.g. 'tv_embedded,ios'
+ * @param {number} timeoutMs
+ * @returns {Promise<string>}
+ */
+function _ytdlpDumpJson(url, playerClient, timeoutMs) {
   return new Promise((resolve, reject) => {
     const args = [
       '--dump-json',
       '--no-playlist',
-      '--socket-timeout', '20',
+      '--socket-timeout', '30',
       '--no-warnings',
       '--no-check-certificates',
-      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-      '--extractor-args', 'youtube:player_client=android,web',
+      '--age-limit', '99',
+      '--user-agent', 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36',
+      '--extractor-args', `youtube:player_client=${playerClient}`,
       url,
     ];
 
-    console.log(`[yt-dlp] info: ${url}`);
     const proc = spawn(YTDLP_BIN, args, { env: { ...process.env } });
-
     let stdout = '';
     let stderr = '';
+    proc.stdout.on('data', (c) => { stdout += c.toString(); });
+    proc.stderr.on('data', (c) => { stderr += c.toString(); });
 
-    proc.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
-    proc.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    const timer = setTimeout(() => {
+      proc.kill('SIGKILL');
+      reject(new Error('timeout'));
+    }, timeoutMs);
 
     proc.on('close', (code) => {
-      if (code !== 0) {
-        console.error(`[yt-dlp] info failed (code ${code}): ${stderr.slice(0, 500)}`);
-        return reject(new Error(parseYtdlpError(stderr)));
-      }
+      clearTimeout(timer);
+      if (code !== 0) return reject(new Error(stderr));
+      resolve(stdout);
+    });
+    proc.on('error', (e) => { clearTimeout(timer); reject(e); });
+  });
+}
+
+/**
+ * Fetches video metadata, trying multiple player clients in order.
+ * tv_embedded + ios bypass YouTube's cloud-IP sign-in blocks best.
+ */
+function getVideoInfo(url) {
+  // Client order: most reliable on datacenter IPs first
+  const CLIENTS = [
+    'tv_embedded,ios',
+    'tv_embedded,web_creator',
+    'web_creator,ios',
+    'mweb,ios',
+  ];
+
+  return new Promise(async (resolve, reject) => {
+    console.log(`[yt-dlp] info: ${url}`);
+    let lastError = null;
+
+    for (const client of CLIENTS) {
       try {
+        console.log(`[yt-dlp] trying player_client=${client}`);
+        const stdout = await _ytdlpDumpJson(url, client, 35_000);
         const raw = JSON.parse(stdout);
-        resolve(sanitizeVideoInfo(raw));
-      } catch (e) {
-        reject(new Error('Failed to parse yt-dlp output'));
+        console.log(`[yt-dlp] success with client=${client}`);
+        return resolve(sanitizeVideoInfo(raw));
+      } catch (err) {
+        lastError = err;
+        const msg = err.message || '';
+        // Only retry on sign-in / auth errors — fail fast on real errors
+        const isAuthError = msg.includes('Sign in') || msg.includes('age-restricted') ||
+                            msg.includes('login') || msg.includes('unavailable') ||
+                            msg.includes('timeout');
+        if (!isAuthError) break;
+        console.warn(`[yt-dlp] client=${client} failed: ${msg.slice(0, 120)} — trying next`);
       }
-    });
+    }
 
-    proc.on('error', (err) => {
-      reject(new Error(`yt-dlp not found or failed to start: ${err.message}`));
-    });
-
-    // Safety timeout — kill if yt-dlp hangs
-    setTimeout(() => {
-      proc.kill('SIGKILL');
-      reject(new Error('yt-dlp info request timed out (30s)'));
-    }, 30_000);
+    reject(new Error(parseYtdlpError(lastError?.message || '')));
   });
 }
 
@@ -224,9 +259,10 @@ function downloadStream(url, formatId, res) {
       '--no-playlist',
       '--no-warnings',
       '--no-check-certificates',
-      '--socket-timeout', '25',
-      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-      '--extractor-args', 'youtube:player_client=android,web',
+      '--socket-timeout', '30',
+      '--age-limit', '99',
+      '--user-agent', 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36',
+      '--extractor-args', 'youtube:player_client=tv_embedded,ios',
       '-f', selector,
       '-o', '-',       // pipe to stdout
       url,
@@ -268,9 +304,10 @@ function downloadStream(url, formatId, res) {
       '--no-playlist',
       '--no-warnings',
       '--no-check-certificates',
-      '--socket-timeout', '25',
-      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-      '--extractor-args', 'youtube:player_client=android,web',
+      '--socket-timeout', '30',
+      '--age-limit', '99',
+      '--user-agent', 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36',
+      '--extractor-args', 'youtube:player_client=tv_embedded,ios',
       '-f', selector,
       '--merge-output-format', 'm4a',
       '-o', '-',
@@ -293,9 +330,10 @@ function downloadStream(url, formatId, res) {
     '--no-playlist',
     '--no-warnings',
     '--no-check-certificates',
-    '--socket-timeout', '25',
-    '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    '--extractor-args', 'youtube:player_client=android,web',
+    '--socket-timeout', '30',
+    '--age-limit', '99',
+    '--user-agent', 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36',
+    '--extractor-args', 'youtube:player_client=tv_embedded,ios',
     '-f', selector,
     '--merge-output-format', 'mp4',
     '--ffmpeg-location', FFMPEG_BIN,

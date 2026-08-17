@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import {
   Search, Download, Play, Music, Film,
   AlertCircle, CheckCircle, Loader, User,
@@ -35,6 +35,17 @@ const parseVideoId = (url) => {
   return null;
 };
 
+// Returns true if the string looks like a complete, valid YouTube URL
+const isValidYouTubeUrl = (val) => {
+  try {
+    const u = new URL(val.trim());
+    const host = u.hostname.replace('www.', '');
+    if (!['youtube.com', 'youtu.be', 'm.youtube.com', 'music.youtube.com'].includes(host)) return false;
+    if (host === 'youtu.be') return u.pathname.length > 2;  // /VIDEOID
+    return u.searchParams.has('v') || u.pathname.startsWith('/shorts/');
+  } catch { return false; }
+};
+
 const formatViews = (n) => {
   if (!n) return '—';
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -52,11 +63,14 @@ export default function VideoDownloaderTool() {
   const [downloading,    setDownloading]    = useState(false);
   const [error,          setError]          = useState('');
   const [backendOnline,  setBackendOnline]  = useState(null);   // null=unknown
+  const [elapsed,        setElapsed]        = useState(0);      // seconds since fetch started
+  const elapsedRef  = useRef(null);
+  const debounceRef = useRef(null);
 
   // ── Check backend health ────────────────────────────────────────────────────
   const checkBackend = async () => {
     try {
-      const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(5000) });
+      const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(8000) });
       setBackendOnline(res.ok);
       return res.ok;
     } catch {
@@ -65,29 +79,58 @@ export default function VideoDownloaderTool() {
     }
   };
 
+  // ── Start / stop elapsed timer ──────────────────────────────────────────────
+  const startTimer = () => {
+    setElapsed(0);
+    elapsedRef.current = setInterval(() => setElapsed(s => s + 1), 1000);
+  };
+  const stopTimer = () => {
+    clearInterval(elapsedRef.current);
+    elapsedRef.current = null;
+  };
+
+  // ── Fetch video info from backend (single attempt) ──────────────────────────
+  const fetchVideoInfo = async (trimmed) => {
+    const res = await fetch(`${API_BASE}/api/video/info`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ url: trimmed }),
+      signal:  AbortSignal.timeout(90_000),   // 90s covers Render cold-start
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || `Server error ${res.status}`);
+    return json;
+  };
+
   // ── Fetch video info from backend ───────────────────────────────────────────
-  const handleAnalyze = async () => {
-    if (!url.trim()) return;
+  // Core fetch logic — accepts an explicit URL or falls back to state
+  const handleAnalyzeUrl = async (explicitUrl) => {
+    const trimmed = (explicitUrl || url || '').trim();
+    if (!trimmed) return;
+    if (loading) return;   // debounce guard
     setError('');
     setVideoInfo(null);
     setSelectedFormat(null);
+    setUrl(trimmed);
 
-    const trimmed = url.trim();
     const vid = parseVideoId(trimmed);
 
     setLoading(true);
+    startTimer();
     try {
-      const res = await fetch(`${API_BASE}/api/video/info`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ url: trimmed }),
-        signal:  AbortSignal.timeout(35_000),
-      });
-
-      const json = await res.json();
-
-      if (!res.ok) {
-        throw new Error(json.error || `Server error ${res.status}`);
+      let json;
+      try {
+        json = await fetchVideoInfo(trimmed);
+      } catch (firstErr) {
+        // Auto-retry once on timeout / network error (covers Render waking up)
+        if (firstErr.name === 'TimeoutError' || firstErr.message.includes('fetch') || firstErr.message.includes('Failed to fetch')) {
+          setError('Backend is waking up… retrying automatically (this can take up to 60s on first visit).');
+          await new Promise(r => setTimeout(r, 3000));
+          setError('');
+          json = await fetchVideoInfo(trimmed);  // second attempt — throws if still failing
+        } else {
+          throw firstErr;
+        }
       }
 
       setVideoInfo(json.data);
@@ -95,17 +138,22 @@ export default function VideoDownloaderTool() {
       setBackendOnline(true);
     } catch (err) {
       if (err.name === 'TimeoutError') {
-        setError('Request timed out. The backend may be starting up — try again in a moment.');
+        setError('The backend is still starting up. Please wait 30 seconds and try again — it only takes long on the very first visit.');
+        setBackendOnline(false);
       } else if (err.message.includes('fetch') || err.message.includes('network') || err.message.includes('Failed to fetch')) {
-        setError('Cannot connect to the backend yet. The free server on Render is waking up (~30s) or still building — please wait a moment and try again.');
+        setError('Cannot reach the backend. The free Render server may still be waking up — wait 30s and retry.');
         setBackendOnline(false);
       } else {
         setError(err.message || 'Failed to fetch video info.');
       }
     } finally {
+      stopTimer();
       setLoading(false);
     }
   };
+
+  // Button click — reads from state
+  const handleAnalyze = () => handleAnalyzeUrl(url);
 
   // ── Trigger real download ───────────────────────────────────────────────────
   const handleDownload = () => {
@@ -200,9 +248,26 @@ export default function VideoDownloaderTool() {
             <input
               type="text"
               className="input input-lg"
-              placeholder="https://www.youtube.com/watch?v=..."
+              placeholder="Paste a YouTube URL — auto-fetches instantly"
               value={url}
-              onChange={e => setUrl(e.target.value)}
+              onChange={e => {
+                const val = e.target.value;
+                setUrl(val);
+                // Auto-fetch after a short debounce when a valid URL is detected
+                clearTimeout(debounceRef.current);
+                if (isValidYouTubeUrl(val) && !loading) {
+                  debounceRef.current = setTimeout(() => handleAnalyzeUrl(val), 400);
+                }
+              }}
+              onPaste={e => {
+                // Grab the pasted text directly (before React state updates)
+                const pasted = e.clipboardData.getData('text').trim();
+                if (isValidYouTubeUrl(pasted) && !loading) {
+                  e.preventDefault();
+                  setUrl(pasted);
+                  setTimeout(() => handleAnalyzeUrl(pasted), 0);
+                }
+              }}
               onKeyDown={e => e.key === 'Enter' && handleAnalyze()}
               style={{ paddingLeft: 42 }}
             />
@@ -214,7 +279,7 @@ export default function VideoDownloaderTool() {
             style={{ flexShrink: 0 }}
           >
             {loading
-              ? <><Loader size={16} className="animate-spin" /> Fetching...</>
+              ? <><Loader size={16} className="animate-spin" /> {elapsed > 5 ? `Waking backend… ${elapsed}s` : 'Fetching...'}</>
               : <><Search size={16} /> Get Info</>
             }
           </button>
@@ -232,7 +297,7 @@ export default function VideoDownloaderTool() {
         <div style={{ display: 'flex', gap: 8, marginTop: 14, flexWrap: 'wrap', alignItems: 'center' }}>
           <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Try:</span>
           {['https://youtu.be/dQw4w9WgXcQ', 'https://www.youtube.com/watch?v=jNQXAC9IVRw'].map(u => (
-            <button key={u} className="btn btn-ghost btn-sm" style={{ fontSize: 11 }} onClick={() => setUrl(u)}>
+            <button key={u} className="btn btn-ghost btn-sm" style={{ fontSize: 11 }} onClick={() => { setUrl(u); handleAnalyzeUrl(u); }}>
               {u.slice(8, 38)}…
             </button>
           ))}
@@ -250,10 +315,28 @@ export default function VideoDownloaderTool() {
               <div style={{ height: 12, width: '30%', borderRadius: 4, background: 'rgba(255,255,255,0.04)' }} />
             </div>
           </div>
-          <p style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
-            <Loader size={14} className="animate-spin" style={{ display: 'inline', marginRight: 6 }} />
-            Fetching video info via yt-dlp…
-          </p>
+          <div style={{ textAlign: 'center' }}>
+            <p style={{ color: 'var(--text-muted)', fontSize: 13, marginBottom: 6 }}>
+              <Loader size={14} className="animate-spin" style={{ display: 'inline', marginRight: 6 }} />
+              {elapsed <= 5
+                ? 'Fetching video info via yt-dlp…'
+                : elapsed <= 20
+                ? `Contacting backend… ${elapsed}s`
+                : `Backend is waking up from sleep… ${elapsed}s (up to 60s on first visit)`
+              }
+            </p>
+            {elapsed > 5 && (
+              <div style={{ height: 3, background: 'rgba(255,255,255,0.06)', borderRadius: 2, overflow: 'hidden', maxWidth: 280, margin: '0 auto' }}>
+                <div style={{
+                  height: '100%',
+                  width: `${Math.min((elapsed / 75) * 100, 98)}%`,
+                  background: 'linear-gradient(90deg, var(--accent-cyan), var(--accent-blue))',
+                  borderRadius: 2,
+                  transition: 'width 1s linear',
+                }} />
+              </div>
+            )}
+          </div>
         </div>
       )}
 
