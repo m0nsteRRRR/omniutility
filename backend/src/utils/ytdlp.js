@@ -203,8 +203,8 @@ function _ytdlpDumpJson(url, playerClient, timeoutMs) {
 function getVideoInfo(url) {
   const hasCookies = !!getCookiesPath();
   const CLIENTS = hasCookies
-    ? ['default', 'web,android', 'mweb,ios', 'tv_embedded,ios']
-    : ['tv_embedded,ios', 'tv_embedded,web_creator', 'web_creator,ios', 'mweb,ios', 'android,ios'];
+    ? ['default', 'android_vr', 'web,android', 'mweb,ios', 'android_creator']
+    : ['android_vr', 'android_creator', 'ios', 'mweb,ios', 'tv_embedded,ios', 'web_creator'];
 
   return new Promise(async (resolve, reject) => {
     console.log(`[yt-dlp] info: ${url}`);
@@ -436,9 +436,10 @@ function startBackgroundDownload(jobId, url, formatId) {
 
   console.log(`[yt-dlp bg] job: ${jobId} | ${url} | format: ${formatId}`);
 
+  const hasCookies = !!getCookiesPath();
   let ytdlpArgs = [
     '--no-playlist',
-    ...baseArgs('tv_embedded,ios'),
+    ...baseArgs(hasCookies ? 'default' : 'android_vr'),
     '-f', selector,
     '--newline', // Force newline to parse progress
   ];
