@@ -22,8 +22,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# ── yt-dlp (latest stable via pip) ───────────────────────────────────────────
-RUN pip3 install --no-cache-dir yt-dlp --break-system-packages
+# ── yt-dlp (always latest — extractor fixes are frequent) ────────────────────
+RUN pip3 install --no-cache-dir --upgrade yt-dlp --break-system-packages
 
 # ── Verify all binaries ───────────────────────────────────────────────────────
 RUN echo "=== Versions ===" \

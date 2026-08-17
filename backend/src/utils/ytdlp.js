@@ -12,11 +12,46 @@
 
 const { spawn } = require('child_process');
 const path = require('path');
+const fs   = require('fs');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const YTDLP_BIN  = process.env.YTDLP_PATH  || 'yt-dlp';
 const FFMPEG_BIN = process.env.FFMPEG_PATH || 'ffmpeg';
 const TEMP_DIR   = process.env.TEMP_DIR    || '/tmp/ytdlp-scratch';
+
+// ── Cookies support ───────────────────────────────────────────────────────────
+// Set YTDLP_COOKIES_B64 in Render env vars to a base64-encoded Netscape-format
+// cookies.txt from your browser. This bypasses YouTube's datacenter IP blocks.
+let COOKIES_FILE = null;
+if (process.env.YTDLP_COOKIES_B64) {
+  try {
+    const cookiesPath = '/tmp/yt-cookies.txt';
+    fs.writeFileSync(cookiesPath, Buffer.from(process.env.YTDLP_COOKIES_B64, 'base64').toString('utf8'));
+    COOKIES_FILE = cookiesPath;
+    console.log('[ytdlp] Cookies file loaded from YTDLP_COOKIES_B64');
+  } catch (e) {
+    console.warn('[ytdlp] Failed to write cookies file:', e.message);
+  }
+}
+
+/**
+ * Returns the base yt-dlp args shared across all calls.
+ * Injects --cookies if YTDLP_COOKIES_B64 is set.
+ * @param {string} playerClient  e.g. 'tv_embedded,ios'
+ * @returns {string[]}
+ */
+function baseArgs(playerClient) {
+  const args = [
+    '--no-warnings',
+    '--no-check-certificates',
+    '--socket-timeout', '30',
+    '--age-limit', '99',
+    '--user-agent', 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36',
+    '--extractor-args', `youtube:player_client=${playerClient}`,
+  ];
+  if (COOKIES_FILE) args.push('--cookies', COOKIES_FILE);
+  return args;
+}
 
 // Supported YouTube-like domains
 const YOUTUBE_DOMAINS = [
@@ -110,12 +145,7 @@ function _ytdlpDumpJson(url, playerClient, timeoutMs) {
     const args = [
       '--dump-json',
       '--no-playlist',
-      '--socket-timeout', '30',
-      '--no-warnings',
-      '--no-check-certificates',
-      '--age-limit', '99',
-      '--user-agent', 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36',
-      '--extractor-args', `youtube:player_client=${playerClient}`,
+      ...baseArgs(playerClient),
       url,
     ];
 
@@ -257,12 +287,7 @@ function downloadStream(url, formatId, res) {
   if (formatId === 'mp3') {
     const ytdlpArgs = [
       '--no-playlist',
-      '--no-warnings',
-      '--no-check-certificates',
-      '--socket-timeout', '30',
-      '--age-limit', '99',
-      '--user-agent', 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36',
-      '--extractor-args', 'youtube:player_client=tv_embedded,ios',
+      ...baseArgs('tv_embedded,ios'),
       '-f', selector,
       '-o', '-',       // pipe to stdout
       url,
@@ -302,12 +327,7 @@ function downloadStream(url, formatId, res) {
   if (formatId === 'm4a') {
     const ytdlpArgs = [
       '--no-playlist',
-      '--no-warnings',
-      '--no-check-certificates',
-      '--socket-timeout', '30',
-      '--age-limit', '99',
-      '--user-agent', 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36',
-      '--extractor-args', 'youtube:player_client=tv_embedded,ios',
+      ...baseArgs('tv_embedded,ios'),
       '-f', selector,
       '--merge-output-format', 'm4a',
       '-o', '-',
@@ -328,12 +348,7 @@ function downloadStream(url, formatId, res) {
 
   const ytdlpArgs = [
     '--no-playlist',
-    '--no-warnings',
-    '--no-check-certificates',
-    '--socket-timeout', '30',
-    '--age-limit', '99',
-    '--user-agent', 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36',
-    '--extractor-args', 'youtube:player_client=tv_embedded,ios',
+    ...baseArgs('tv_embedded,ios'),
     '-f', selector,
     '--merge-output-format', 'mp4',
     '--ffmpeg-location', FFMPEG_BIN,
