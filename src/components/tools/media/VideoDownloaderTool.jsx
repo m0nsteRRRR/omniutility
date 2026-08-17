@@ -183,7 +183,7 @@ export default function VideoDownloaderTool() {
   const formats = ALL_FORMATS.map(f => ({
     ...f,
     available: videoInfo ? availableIds.has(f.id) : true, // show all when no info yet
-  }));
+  })).filter(f => f.available);
 
   return (
     <div style={{ maxWidth: 840, margin: '0 auto' }}>
@@ -427,7 +427,7 @@ export default function VideoDownloaderTool() {
           {/* Format grid */}
           <h3 style={{ marginBottom: 6 }}>Select Format & Quality</h3>
           <p style={{ fontSize: 13, marginBottom: 16 }}>
-            Formats confirmed available for this video are highlighted.
+            Showing only the formats available for this video.
             {videoInfo.availableFormats?.length > 0 && (
               <span style={{ color: 'var(--accent-cyan)', marginLeft: 6 }}>
                 {videoInfo.availableFormats.length} formats detected.
