@@ -3,12 +3,15 @@
 const express = require('express');
 const router  = express.Router();
 
-const {
   getVideoInfo,
   downloadStream,
+  startBackgroundDownload,
   isYouTubeUrl,
   isSafeUrl,
 } = require('../utils/ytdlp');
+const { getJob, createJob, jobs } = require('../utils/jobStore');
+const { v4: uuidv4 } = require('uuid');
+const fs = require('fs');
 
 const { infoLimiter, downloadLimiter } = require('../middleware/rateLimit');
 
@@ -51,42 +54,89 @@ router.post('/info', infoLimiter, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/video/download
+// POST /api/video/download
 //
-// Query params:
-//   url      {string}  - encoded video URL
-//   format   {string}  - one of: 4k, 2k, 1080, 720, 480, 360, mp3, m4a
-//
-// Streams the file directly to the response with appropriate headers.
+// Body: { url, format }
+// Starts a background download job and returns jobId
 // ─────────────────────────────────────────────────────────────────────────────
-router.get('/download', downloadLimiter, (req, res) => {
-  const { url, format } = req.query;
+router.post('/download', downloadLimiter, (req, res) => {
+  const { url, format } = req.body;
 
-  // ── Input validation ──────────────────────────────────────────────────────
   const VALID_FORMATS = ['4k', '2k', '1080', '720', '480', '360', 'mp3', 'm4a'];
 
   if (!url || typeof url !== 'string') {
-    return res.status(400).json({ error: 'Missing "url" query parameter.', code: 'MISSING_URL' });
+    return res.status(400).json({ error: 'Missing "url" in request body.', code: 'MISSING_URL' });
   }
   if (!format || !VALID_FORMATS.includes(format)) {
     return res.status(400).json({ error: `Invalid format. Must be one of: ${VALID_FORMATS.join(', ')}`, code: 'INVALID_FORMAT' });
   }
 
-  const decodedUrl = decodeURIComponent(url);
-
-  if (!isSafeUrl(decodedUrl)) {
+  if (!isSafeUrl(url)) {
     return res.status(400).json({ error: 'Invalid URL.', code: 'INVALID_URL' });
   }
-  if (process.env.YOUTUBE_ONLY === 'true' && !isYouTubeUrl(decodedUrl)) {
+  if (process.env.YOUTUBE_ONLY === 'true' && !isYouTubeUrl(url)) {
     return res.status(400).json({ error: 'Only YouTube URLs are supported.', code: 'UNSUPPORTED_DOMAIN' });
   }
 
-  // ── Determine output file extension and MIME type ─────────────────────────
-  const isAudio    = format === 'mp3' || format === 'm4a';
-  const ext        = format === 'mp3' ? 'mp3' : format === 'm4a' ? 'm4a' : 'mp4';
-  const mime       = isAudio
-    ? (format === 'mp3' ? 'audio/mpeg' : 'audio/mp4')
-    : 'video/mp4';
+  const jobId = uuidv4();
+  createJob(jobId, url, format);
+
+  // Start background process
+  try {
+    startBackgroundDownload(jobId, url, format);
+    return res.json({ success: true, jobId });
+  } catch (err) {
+    console.error('[POST /download] spawn error:', err.message);
+    jobs.delete(jobId);
+    return res.status(500).json({ error: 'Failed to start download.', code: 'SPAWN_ERROR' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/video/download/:jobId
+//
+// Returns job progress
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/download/:jobId', (req, res) => {
+  const job = getJob(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found', code: 'JOB_NOT_FOUND' });
+  }
+
+  res.json({
+    success: true,
+    status: job.status,
+    progress: job.progress,
+    error: job.errorMsg
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/video/download/:jobId/file
+//
+// Streams the completed file to the user and cleans up the job
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/download/:jobId/file', (req, res) => {
+  const jobId = req.params.jobId;
+  const job = getJob(jobId);
+
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found', code: 'JOB_NOT_FOUND' });
+  }
+
+  if (job.status !== 'completed' || !job.filePath) {
+    return res.status(400).json({ error: 'Job not ready or file missing', code: 'JOB_NOT_READY' });
+  }
+
+  if (!fs.existsSync(job.filePath)) {
+    jobs.delete(jobId);
+    return res.status(404).json({ error: 'File no longer exists on server', code: 'FILE_MISSING' });
+  }
+
+  const format = job.format;
+  const isAudio = format === 'mp3' || format === 'm4a';
+  const ext = format === 'mp3' ? 'mp3' : format === 'm4a' ? 'm4a' : 'mp4';
+  const mime = isAudio ? (format === 'mp3' ? 'audio/mpeg' : 'audio/mp4') : 'video/mp4';
 
   const qualityLabel = {
     '4k': '4K-2160p', '2k': '2K-1440p', '1080': '1080p',
@@ -96,32 +146,31 @@ router.get('/download', downloadLimiter, (req, res) => {
 
   const filename = `video-${qualityLabel}.${ext}`;
 
-  // ── Set response headers ──────────────────────────────────────────────────
   res.setHeader('Content-Type', mime);
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   res.setHeader('X-Format', format);
-  // Allow the frontend to read these custom headers cross-origin
   res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, X-Format');
 
-  console.log(`[GET /download] ${req.ip} | format=${format} | ${decodedUrl}`);
-
-  // ── Start the download stream ─────────────────────────────────────────────
-  let handles;
-  try {
-    handles = downloadStream(decodedUrl, format, res);
-  } catch (err) {
-    console.error('[GET /download] spawn error:', err.message);
-    if (!res.headersSent) {
-      return res.status(500).json({ error: 'Failed to start download.', code: 'SPAWN_ERROR' });
-    }
-    return;
+  const stat = fs.statSync(job.filePath);
+  if (!res.headersSent) {
+    res.setHeader('Content-Length', stat.size);
   }
 
-  // ── Handle client disconnect — kill yt-dlp & ffmpeg immediately ───────────
-  req.on('close', () => {
-    console.log(`[GET /download] client disconnected — killing processes`);
-    if (handles?.proc)       handles.proc.kill('SIGKILL');
-    if (handles?.ffmpegProc) handles.ffmpegProc.kill('SIGKILL');
+  const fileStream = fs.createReadStream(job.filePath);
+  fileStream.pipe(res);
+
+  fileStream.on('close', () => {
+    // Delete file and job after serving
+    try {
+      fs.unlinkSync(job.filePath);
+    } catch (e) {}
+    jobs.delete(jobId);
+  });
+
+  fileStream.on('error', (e) => {
+    console.error('[stream error]', e.message);
+    try { fs.unlinkSync(job.filePath); } catch (e) {}
+    jobs.delete(jobId);
   });
 });
 

@@ -64,6 +64,11 @@ export default function VideoDownloaderTool() {
   const [error,          setError]          = useState('');
   const [backendOnline,  setBackendOnline]  = useState(null);   // null=unknown
   const [elapsed,        setElapsed]        = useState(0);      // seconds since fetch started
+  
+  const [downloadJobId,  setDownloadJobId]  = useState(null);
+  const [downloadProgress, setDownloadProgress] = useState(0);
+  const [downloadStatus, setDownloadStatus] = useState('');
+
   const elapsedRef  = useRef(null);
   const debounceRef = useRef(null);
 
@@ -156,23 +161,71 @@ export default function VideoDownloaderTool() {
   const handleAnalyze = () => handleAnalyzeUrl(url);
 
   // ── Trigger real download ───────────────────────────────────────────────────
-  const handleDownload = () => {
+  const handleDownload = async () => {
     if (!selectedFormat || !videoInfo) return;
     setDownloading(true);
+    setError('');
+    setDownloadProgress(0);
+    setDownloadStatus('Starting download...');
 
-    // Build the download URL — browser will navigate to it, triggering the stream
-    const downloadUrl = `${API_BASE}/api/video/download?url=${encodeURIComponent(videoInfo.webpage_url)}&format=${selectedFormat}`;
+    try {
+      // 1. Start Job
+      const startRes = await fetch(`${API_BASE}/api/video/download`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: videoInfo.webpage_url, format: selectedFormat }),
+      });
+      const startData = await startRes.json();
+      if (!startRes.ok) throw new Error(startData.error || 'Failed to start download');
 
-    // Create a hidden <a> and click it — browser downloads via Content-Disposition header
-    const a = document.createElement('a');
-    a.href = downloadUrl;
-    a.style.display = 'none';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+      const jobId = startData.jobId;
+      setDownloadJobId(jobId);
+      setDownloadStatus('Downloading...');
 
-    // Reset downloading state after a delay (we can't track streaming progress from the browser easily)
-    setTimeout(() => setDownloading(false), 3000);
+      // 2. Poll for progress
+      const pollInterval = setInterval(async () => {
+        try {
+          const progRes = await fetch(`${API_BASE}/api/video/download/${jobId}`);
+          const progData = await progRes.json();
+          
+          if (!progRes.ok) throw new Error(progData.error || 'Failed to fetch progress');
+          
+          setDownloadProgress(progData.progress);
+          
+          if (progData.status === 'merging') {
+             setDownloadStatus('Merging audio & video...');
+          } else if (progData.status === 'completed') {
+             clearInterval(pollInterval);
+             setDownloadStatus('Completed! Serving file...');
+             
+             // 3. Trigger file download
+             const a = document.createElement('a');
+             a.href = `${API_BASE}/api/video/download/${jobId}/file`;
+             a.style.display = 'none';
+             document.body.appendChild(a);
+             a.click();
+             document.body.removeChild(a);
+             
+             setTimeout(() => {
+               setDownloading(false);
+               setDownloadJobId(null);
+             }, 2000);
+          } else if (progData.status === 'error') {
+             clearInterval(pollInterval);
+             throw new Error(progData.error || 'Download failed');
+          }
+        } catch (pollErr) {
+          clearInterval(pollInterval);
+          setError(pollErr.message);
+          setDownloading(false);
+          setDownloadJobId(null);
+        }
+      }, 1000);
+
+    } catch (err) {
+      setError(err.message);
+      setDownloading(false);
+    }
   };
 
   const fmt = ALL_FORMATS.find(f => f.id === selectedFormat);
@@ -488,20 +541,38 @@ export default function VideoDownloaderTool() {
             })}
           </div>
 
-          {/* Download button */}
-          <button
-            className="btn btn-primary btn-xl"
-            onClick={handleDownload}
-            disabled={!selectedFormat || downloading}
-            style={{ width: '100%', opacity: !selectedFormat ? 0.5 : 1 }}
-          >
-            {downloading
-              ? <><Loader size={18} className="animate-spin" /> Starting download…</>
-              : selectedFormat
-                ? <><Download size={18} /> Download {fmt?.label} — {fmt?.desc}</>
-                : <><Download size={18} /> Select a format above</>
-            }
-          </button>
+          {/* Download button & Progress */}
+          {!downloadJobId ? (
+            <button
+              className="btn btn-primary btn-xl"
+              onClick={handleDownload}
+              disabled={!selectedFormat || downloading}
+              style={{ width: '100%', opacity: !selectedFormat ? 0.5 : 1 }}
+            >
+              {downloading
+                ? <><Loader size={18} className="animate-spin" /> Starting download…</>
+                : selectedFormat
+                  ? <><Download size={18} /> Download {fmt?.label} — {fmt?.desc}</>
+                  : <><Download size={18} /> Select a format above</>
+              }
+            </button>
+          ) : (
+            <div style={{ background: 'rgba(255,255,255,0.03)', padding: 16, borderRadius: 'var(--radius-md)', border: '1px solid var(--border-default)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8, fontSize: 13, fontWeight: 600 }}>
+                <span style={{ color: 'var(--text-primary)' }}>{downloadStatus}</span>
+                <span style={{ color: 'var(--accent-cyan)' }}>{downloadProgress}%</span>
+              </div>
+              <div style={{ height: 6, background: 'rgba(255,255,255,0.06)', borderRadius: 3, overflow: 'hidden' }}>
+                <div style={{
+                  height: '100%',
+                  width: `${downloadProgress}%`,
+                  background: 'linear-gradient(90deg, var(--accent-cyan), var(--accent-blue))',
+                  borderRadius: 3,
+                  transition: 'width 0.3s linear',
+                }} />
+              </div>
+            </div>
+          )}
 
           <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 10, textAlign: 'center' }}>
             ✅ Real download powered by yt-dlp running in Docker. File streams directly to your browser.

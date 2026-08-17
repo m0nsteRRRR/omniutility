@@ -13,6 +13,7 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const fs   = require('fs');
+const { updateJob } = require('./jobStore');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const YTDLP_BIN  = process.env.YTDLP_PATH  || 'yt-dlp';
@@ -395,6 +396,89 @@ function downloadStream(url, formatId, res) {
   return { proc: ytProc, ffmpegProc: null };
 }
 
+// ── Background Download ───────────────────────────────────────────────────────
+
+/**
+ * Starts a background download and updates progress in the job store.
+ * @param {string} jobId 
+ * @param {string} url 
+ * @param {string} formatId 
+ */
+function startBackgroundDownload(jobId, url, formatId) {
+  const { v4: uuidv4 } = require('uuid');
+  const selector = getFormatSelector(formatId);
+  const isAudio  = formatId === 'mp3' || formatId === 'm4a';
+  const ext      = formatId === 'mp3' ? 'mp3' : formatId === 'm4a' ? 'm4a' : 'mp4';
+  const tmpFile  = path.join(TEMP_DIR, `${uuidv4()}.${ext}`);
+
+  console.log(`[yt-dlp bg] job: ${jobId} | ${url} | format: ${formatId}`);
+
+  let ytdlpArgs = [
+    '--no-playlist',
+    ...baseArgs('tv_embedded,ios'),
+    '-f', selector,
+    '--newline', // Force newline to parse progress
+  ];
+
+  if (isAudio) {
+    if (formatId === 'mp3') {
+      ytdlpArgs.push('-x', '--audio-format', 'mp3', '--audio-quality', '320K', '--ffmpeg-location', FFMPEG_BIN);
+    } else {
+      ytdlpArgs.push('-x', '--audio-format', 'm4a', '--ffmpeg-location', FFMPEG_BIN);
+    }
+    // yt-dlp's post-processor appends the extension, so we strip it for the -o template
+    ytdlpArgs.push('-o', tmpFile.replace(/\.(mp3|m4a)$/, ''));
+  } else {
+    ytdlpArgs.push('--merge-output-format', 'mp4', '--ffmpeg-location', FFMPEG_BIN, '-o', tmpFile);
+  }
+  
+  ytdlpArgs.push(url);
+
+  const proc = spawn(YTDLP_BIN, ytdlpArgs, { env: { ...process.env } });
+
+  updateJob(jobId, { proc, filePath: tmpFile });
+
+  // Parse progress from stdout
+  proc.stdout.on('data', (d) => {
+    const lines = d.toString().split('\n');
+    for (const line of lines) {
+      // Look for: [download]  12.3% of 50MiB...
+      const match = line.match(/\[download\]\s+([\d\.]+)%/);
+      if (match && match[1]) {
+        const pct = parseFloat(match[1]);
+        if (!isNaN(pct)) {
+          updateJob(jobId, { progress: pct });
+        }
+      } else if (line.includes('[ExtractAudio]') || line.includes('[Merger]')) {
+        updateJob(jobId, { status: 'merging' });
+      }
+    }
+  });
+
+  let stderr = '';
+  proc.stderr.on('data', (d) => {
+    stderr += d.toString();
+  });
+
+  proc.on('error', (e) => {
+    console.error(`[yt-dlp bg error] job ${jobId}:`, e.message);
+    cleanup(tmpFile);
+    updateJob(jobId, { status: 'error', errorMsg: e.message });
+  });
+
+  proc.on('close', (code) => {
+    if (code === 0) {
+      console.log(`[yt-dlp bg completed] job ${jobId}`);
+      updateJob(jobId, { status: 'completed', progress: 100 });
+    } else {
+      console.error(`[yt-dlp bg failed] job ${jobId} exited ${code}`);
+      cleanup(tmpFile);
+      const errMsg = parseYtdlpError(stderr);
+      updateJob(jobId, { status: 'error', errorMsg: errMsg });
+    }
+  });
+}
+
 // ── Error Parsing ─────────────────────────────────────────────────────────────
 
 /**
@@ -424,9 +508,9 @@ function cleanup(filePath) {
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────
-module.exports = {
   getVideoInfo,
   downloadStream,
+  startBackgroundDownload,
   isYouTubeUrl,
   isSafeUrl,
   getFormatSelector,
